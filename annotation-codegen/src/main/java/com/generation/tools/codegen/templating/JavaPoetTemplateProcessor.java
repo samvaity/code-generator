@@ -23,6 +23,7 @@ import javax.annotation.processing.ProcessingEnvironment;
 import javax.lang.model.element.Modifier;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
@@ -99,9 +100,6 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
                 .addMethod(getInstance)
                 .addMethod(constructor);
 
-        // configure request if body present
-        configureRequestWithBody();
-
         for (HttpRequestContext method : templateInput.getHttpRequestContexts()) {
             generateMethod(method);
             generateInternalMethod(method);
@@ -177,14 +175,14 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
         methodBuilder
                 .addStatement("String host = $L", method.getHost())
                 .addCode("\n")
-                .addStatement("// create the request")
+                .addComment("create the request")
                 .addStatement("$T httpRequest = new $T($T.$L, host)", HTTP_REQUEST, HTTP_REQUEST, HTTP_METHOD, method.getHttpMethod());
 
         // add headers
         if (!method.getHeaders().isEmpty()) {
             methodBuilder
                     .addCode("\n")
-                    .addStatement("// set the headers")
+                    .addComment("set the headers")
                     .addStatement("$T headers = new $T()", ClassName.get("io.clientcore.core.http.models", "HttpHeaders"), ClassName.get("io.clientcore.core.http.models", "HttpHeaders"));
             for (Map.Entry<String, String> header : method.getHeaders().entrySet()) {
                 methodBuilder.addStatement("headers.add($T.fromString($S), $S)", ClassName.get("io.clientcore.core.http.models", "HttpHeaderName"), header.getKey(), header.getValue());
@@ -197,24 +195,24 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
         // [TODO] set SSE listener if available
 
         // set the body
+        methodBuilder
+                .addCode("\n")
+                .addComment("set the body content if present");
         if (method.getBody() != null) {
             HttpRequestContext.Body body = method.getBody();
             String contentType = body.getContentType();
             String parameterType = body.getParameterType();
             String parameterName = body.getParameterName();
 
-
-            methodBuilder
-                    .addCode("\n")
-                    .addStatement("// set the body");
-
            configureRequestWithBodyAndContentType(methodBuilder, body, contentType, parameterName);
+        } else {
+            methodBuilder.addComment("no body content to set");
         }
 
         // send request through pipeline
         methodBuilder
                 .addCode("\n")
-                .addStatement("// send the request through the pipeline")
+                .addComment("send the request through the pipeline")
                 .addStatement("$T<?> response = pipeline.send(httpRequest)", RESPONSE);
 
         // check for expected status codes
@@ -254,26 +252,75 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
     }
 
     private void configureRequestWithBodyAndContentType(MethodSpec.Builder methodBuilder, Object bodyContentObject, String contentType, String parameterName) {
-        if (contentType == null || contentType.isEmpty()) {
-            if (bodyContentObject instanceof byte[] || bodyContentObject instanceof String) {
-                methodBuilder
-                        .addStatement("httpRequest.getHeaders().set($T.CONTENT_TYPE, $L.fromString($S))", HttpHeaderName.class, ClassName.get("io.clientcore.core.http.models", "ContentType"), ContentType.APPLICATION_OCTET_STREAM);
-                contentType = ContentType.APPLICATION_OCTET_STREAM;
-            } else {
-                methodBuilder
-                        .addStatement("httpRequest.getHeaders().set($T.CONTENT_TYPE, $L.fromString($S))", HttpHeaderName.class, ClassName.get("io.clientcore.core.http.models", "ContentType"), ContentType.APPLICATION_JSON);
-                contentType = ContentType.APPLICATION_JSON;
+        if (bodyContentObject == null) {
+            // No body content to set
+            methodBuilder
+                    .addStatement("httpRequest.getHeaders().set($T.CONTENT_LENGTH, $S))", HttpHeaderName.class, 0);
+        } else {
+
+            if (contentType == null || contentType.isEmpty()) {
+                if (bodyContentObject instanceof byte[] || bodyContentObject instanceof String) {
+                    methodBuilder
+                            .addStatement("httpRequest.getHeaders().set($T.CONTENT_TYPE, $L.fromString($S))", HttpHeaderName.class, ClassName.get("io.clientcore.core.http.models", "ContentType"), ContentType.APPLICATION_OCTET_STREAM);
+                } else {
+                    methodBuilder
+                            .addStatement("httpRequest.getHeaders().set($T.CONTENT_TYPE, $L.fromString($S))", HttpHeaderName.class, ClassName.get("io.clientcore.core.http.models", "ContentType"), ContentType.APPLICATION_JSON);
+                }
             }
+
+            if (bodyContentObject instanceof BinaryData) {
+
+                methodBuilder
+                        .addStatement("$T binaryData = ($T) contents", BinaryData.class, BinaryData.class)
+                        .beginControlFlow("if (binaryData.getLength() != null)")
+                        .addStatement("httpRequest.getHeaders().set($T.CONTENT_LENGTH, String.valueOf(binaryData.getLength()))", HttpHeaderName.class)
+                        .addStatement("httpRequest.setBody(binaryData)")
+                        .endControlFlow();
+            }
+
+
+            boolean isJson = false;
+            final String[] contentTypeParts = contentType.split(";");
+
+            for (final String contentTypePart : contentTypeParts) {
+                if (contentTypePart.trim().equalsIgnoreCase(ContentType.APPLICATION_JSON)) {
+                    isJson = true;
+
+                    break;
+                }
+            }
+            updateRequestWithBodyContent(methodBuilder, isJson, bodyContentObject, parameterName);
         }
+    }
 
-        methodBuilder
-                .addStatement("$T binaryData = ($T) contents", BinaryData.class, BinaryData.class)
-                .beginControlFlow("if (binaryData.getLength() != null)")
-                .addStatement("httpRequest.getHeaders().set($T.CONTENT_LENGTH, String.valueOf(binaryData.getLength()))", HttpHeaderName.class)
-                .addStatement("httpRequest.setBody(binaryData)")
-                .endControlFlow();
+    private void updateRequestWithBodyContent(MethodSpec.Builder methodBuilder, boolean isJson, Object bodyContentObject, String parameterName) {
+        if (bodyContentObject == null) {
+            return;
+        }
+        if (isJson) {
+            methodBuilder
+                    .addStatement("httpRequest.setBody($T.fromObject($L, serializer))", BinaryData.class, parameterName);
+        } else if (bodyContentObject instanceof byte[]) {
+            methodBuilder
+                    .addStatement("httpRequest.setBody($T.fromBytes((byte[]) $L))", BinaryData.class, parameterName);
+        } else if (bodyContentObject instanceof String) {
+            methodBuilder
+                    .addStatement("httpRequest.setBody($T.fromString((String) $L))", BinaryData.class, parameterName);
+        } else if (bodyContentObject instanceof ByteBuffer) {
+            if (((ByteBuffer) bodyContentObject).hasArray()) {
+                methodBuilder
+                        .addStatement("httpRequest.setBody($T.fromBytes(((ByteBuffer) $L).array()))", BinaryData.class, parameterName);
+            } else {
+                byte[] array = new byte[((ByteBuffer) bodyContentObject).remaining()];
 
-        // [TODO] Add support for other content types
+                ((ByteBuffer) bodyContentObject).get(array);
+                methodBuilder
+                        .addStatement("httpRequest.setBody($T.fromBytes($L))", BinaryData.class, array);
+            }
+        } else {
+            methodBuilder
+                    .addStatement("httpRequest.setBody($T.fromObject($L, serializer))", BinaryData.class, parameterName);
+        }
     }
 
     /*
