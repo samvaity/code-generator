@@ -6,15 +6,15 @@ import com.squareup.javapoet.ClassName;
 import com.squareup.javapoet.FieldSpec;
 import com.squareup.javapoet.JavaFile;
 import com.squareup.javapoet.MethodSpec;
-import com.squareup.javapoet.ParameterSpec;
 import com.squareup.javapoet.ParameterizedTypeName;
 import com.squareup.javapoet.TypeName;
 import com.squareup.javapoet.TypeSpec;
-import com.squareup.javapoet.WildcardTypeName;
 import io.clientcore.core.http.models.ContentType;
 import io.clientcore.core.http.models.HttpHeaderName;
-import io.clientcore.core.http.models.Response;
+import io.clientcore.core.http.models.HttpMethod;
+import io.clientcore.core.http.models.HttpResponse;
 import io.clientcore.core.http.models.ResponseBodyMode;
+import io.clientcore.core.implementation.http.HttpResponseAccessHelper;
 import io.clientcore.core.implementation.http.rest.RestProxyUtils;
 import io.clientcore.core.util.binarydata.BinaryData;
 import io.clientcore.core.util.serializer.ObjectSerializer;
@@ -106,7 +106,7 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
         }
 
         // handle return type implementation
-        handleRestReturnType();
+        // handleResponseMode();
 
         TypeSpec typeSpec = classBuilder.build();
 
@@ -185,12 +185,15 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
                     .addComment("set the headers")
                     .addStatement("$T headers = new $T()", ClassName.get("io.clientcore.core.http.models", "HttpHeaders"), ClassName.get("io.clientcore.core.http.models", "HttpHeaders"));
             for (Map.Entry<String, String> header : method.getHeaders().entrySet()) {
-                methodBuilder.addStatement("headers.add($T.fromString($S), $S)", ClassName.get("io.clientcore.core.http.models", "HttpHeaderName"), header.getKey(), header.getValue());
+                methodBuilder.addStatement("headers.add($T.fromString($S), accept)", ClassName.get("io.clientcore.core.http.models", "HttpHeaderName"), header.getKey());
             }
             methodBuilder.addStatement("httpRequest.setHeaders(headers)");
         }
 
-        // [TODO] set RequestOptions on Request
+        methodBuilder
+                .addCode("\n")
+                .addComment("add RequestOptions to the request")
+                .addStatement("httpRequest.setRequestOptions(requestOptions)");
 
         // [TODO] set SSE listener if available
 
@@ -204,7 +207,7 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
             String parameterType = body.getParameterType();
             String parameterName = body.getParameterName();
 
-           configureRequestWithBodyAndContentType(methodBuilder, body, contentType, parameterName);
+            configureRequestWithBodyAndContentType(methodBuilder, body, contentType, parameterName);
         } else {
             methodBuilder.addComment("no body content to set");
         }
@@ -233,22 +236,63 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
         // add return statement if method return type is not "void"
         if (returnTypeName.toString().contains("void") && returnTypeName.toString().contains("Void")) {
             methodBuilder.addStatement("return");
-        } else if (returnTypeName.toString().contains("Void")) {
-            methodBuilder.beginControlFlow("try")
-                    .addStatement("response.close()")
-                    .nextControlFlow("catch ($T e)", IOException.class)
-                    .addStatement("throw LOGGER.logThrowableAsError(new $T(e))", UncheckedIOException.class)
-                    .endControlFlow();
-            methodBuilder.addStatement("return (Response<Void>) response");
+        } else if (returnTypeName.toString().contains("Response")) {
+            if (returnTypeName.toString().contains("Void")) {
+                methodBuilder.beginControlFlow("try")
+                        .addStatement("response.close()")
+                        .nextControlFlow("catch ($T e)", IOException.class)
+                        .addStatement("throw LOGGER.logThrowableAsError(new $T(e))", UncheckedIOException.class)
+                        .endControlFlow();
+                createResponseIfNecessary(returnTypeName, methodBuilder);
+            } else {
+                methodBuilder.addStatement("$T responseBodyMode = null", ResponseBodyMode.class)
+                        .beginControlFlow("if (requestOptions != null)")
+                        .addStatement("responseBodyMode = requestOptions.getResponseBodyMode()")
+                        .endControlFlow()
+                        .beginControlFlow("if (responseBodyMode == $T.DESERIALIZE)", ResponseBodyMode.class);
+                handleResponseModeToCreateResponse(method, returnTypeName, methodBuilder);
+                methodBuilder
+                        .addStatement("$T.setValue(($T<?>) response, responseBody)", HttpResponseAccessHelper.class, HttpResponse.class)
+                        .nextControlFlow("else");
+                handleResponseModeToCreateResponse(method, returnTypeName, methodBuilder);
+                methodBuilder
+                        .addStatement("$T.setBodyDeserializer(($T<?>) response, (body) -> responseBody)", HttpResponseAccessHelper.class, HttpResponse.class)
+                        .endControlFlow();
+                createResponseIfNecessary(returnTypeName, methodBuilder);
+            }
         } else {
-            methodBuilder.addStatement("$T responseBodyMode = null", ResponseBodyMode.class)
-                    .beginControlFlow("if (requestOptions != null)")
-                    .addStatement("responseBodyMode = requestOptions.getResponseBodyMode()")
-                    .endControlFlow()
-                    // [Remove Cast - make sure to return same as returnTypeName?]
-                    .addStatement("return ($T<BinaryData>) handleResponseMode(response, responseBodyMode)", Response.class);        }
+            handleResponseModeToCreateResponse(method, returnTypeName, methodBuilder);
+        }
 
         classBuilder.addMethod(methodBuilder.build());
+    }
+
+    // TODO: Clarify RestProxyBase#createResponseIfNecessary
+    private static void createResponseIfNecessary(TypeName returnTypeName, MethodSpec.Builder methodBuilder) {
+        methodBuilder.addStatement("return ($T) response", returnTypeName);
+    }
+
+    private static void handleResponseModeToCreateResponse(HttpRequestContext method, TypeName returnTypeName, MethodSpec.Builder methodBuilder) {
+        HttpMethod httpMethod = method.getHttpMethod();
+        if (httpMethod == HttpMethod.HEAD && (returnTypeName.toString().contains("Boolean") || returnTypeName.toString().contains("boolean"))) {
+            methodBuilder.addStatement("return (responseCode / 100) == 2");
+        } else if (returnTypeName.toString().contains("byte[]")) {
+            methodBuilder
+                    .addStatement("$T responseBody = response.getBody()", BinaryData.class)
+                    .addStatement("byte[] responseBodyBytes = responseBody != null ? responseBody.toBytes() : null")
+                    .addStatement("return responseBodyBytes != null ? (responseBodyBytes.length == 0 ? null : responseBodyBytes) : null");
+        } else if (returnTypeName.toString().contains("InputStream")) {
+            methodBuilder
+                    .addStatement("$T responseBody = response.getBody()", BinaryData.class)
+                    .addStatement("return responseBody.toStream()");
+        } else if (returnTypeName.toString().contains("BinaryData")) {
+            methodBuilder
+                    .addStatement("$T responseBody = response.getBody()", BinaryData.class);
+        } else {
+            methodBuilder
+                    .addStatement("$T responseBody = response.getBody()", BinaryData.class)
+                    .addStatement("return decodeByteArray(responseBody.toBytes(), response, serializer, methodParser)");
+        }
     }
 
     private void configureRequestWithBodyAndContentType(MethodSpec.Builder methodBuilder, Object bodyContentObject, String contentType, String parameterName) {
@@ -321,21 +365,6 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
             methodBuilder
                     .addStatement("httpRequest.setBody($T.fromObject($L, serializer))", BinaryData.class, parameterName);
         }
-    }
-
-    /*
-     * Handle the response and return type of the REST API
-     */
-    private void handleRestReturnType() {
-        // TODO: Add implementation details
-        MethodSpec.Builder methodBuilder = MethodSpec.methodBuilder("handleResponseMode")
-                .addModifiers(Modifier.PRIVATE)
-                .addParameter(ParameterSpec.builder(ParameterizedTypeName.get(RESPONSE, WildcardTypeName.subtypeOf(Object.class)), "response").build())
-                .addParameter(ParameterSpec.builder(ResponseBodyMode.class, "responseBodyMode").build())
-                .returns(ParameterizedTypeName.get(RESPONSE, WildcardTypeName.subtypeOf(Object.class)))
-                .addStatement("return response");
-        // handle response mode
-        classBuilder.addMethod(methodBuilder.build());
     }
 
     /*
