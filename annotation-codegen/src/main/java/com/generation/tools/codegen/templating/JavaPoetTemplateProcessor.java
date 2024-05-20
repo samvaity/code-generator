@@ -121,22 +121,6 @@ public class JavaPoetTemplateProcessor implements TemplateProcessor {
         }
     }
 
-    /*
-     * Configure the request with the body if present using the object serializer
-     */
-    private void configureRequestWithBody() {
-        // body length content type context
-        MethodSpec.Builder methodBuilder = MethodSpec.methodBuilder("configRequest")
-                .addModifiers(Modifier.PRIVATE)
-                .returns(HTTP_REQUEST)
-                .addParameter(HTTP_REQUEST, "request")
-                .addParameter(ObjectSerializer.class, "serializer");
-
-        methodBuilder.addStatement("return request");
-
-        classBuilder.addMethod(methodBuilder.build());
-    }
-
     private void generateMethod(HttpRequestContext method) {
 
         MethodSpec.Builder methodBuilder = MethodSpec.methodBuilder(method.getMethodName())

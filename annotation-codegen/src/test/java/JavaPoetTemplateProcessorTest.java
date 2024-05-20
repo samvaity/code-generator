@@ -9,7 +9,6 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.stream.Stream;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class JavaPoetTemplateProcessorTest {
@@ -87,8 +86,6 @@ public class JavaPoetTemplateProcessorTest {
                 Arguments.of(new HttpRequestContext.Body("application/octet-stream", "byte[]", "request"), "httpRequest.setBody(io.clientcore.core.util.binarydata.BinaryData.fromBytes((byte[]) request));"),
                 // Add scenario for parameterType == "String"
                 Arguments.of(new HttpRequestContext.Body("application/octet-stream", "String", "request"), "httpRequest.setBody(io.clientcore.core.util.binarydata.BinaryData.fromString((String) request));")
-
-
         );
     }
 }
